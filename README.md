@@ -27,11 +27,17 @@ Build the package, then register its directory through Paperclip's adapter manag
 npm install
 npm run build
 
-curl -X POST http://localhost:3102/api/adapters \
+curl -X POST http://localhost:3100/api/adapters/install \
   -H "Authorization: Bearer <paperclip-token>" \
   -H "Content-Type: application/json" \
-  -d '{"localPath":"/absolute/path/to/paperclip-adapter"}'
+  -d '{"packageName":"/absolute/path/to/paperclip-adapter","isLocalPath":true}'
 ```
+
+Verified against Paperclip CLI/server `2026.916.0`: the install route is
+`POST /api/adapters/install`, and the body takes `packageName` (required
+string, the package name or local path) plus `isLocalPath: true` for a local
+directory. A body shaped `{"localPath": "..."}` posted to `/api/adapters`
+returns `400 packageName is required and must be a string.`
 
 The adapter type is `schemabounce`.
 
