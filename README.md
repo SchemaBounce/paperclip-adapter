@@ -75,4 +75,21 @@ The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and
 2. Run the **Publish to npm** workflow from the Actions tab. It defaults to a dry run that builds, tests, and packs without publishing.
 3. Run it again with the dry run box cleared to publish. The workflow refuses any ref other than `main` and any version already on npm.
 
-The workflow needs the `NPM_TOKEN` repository secret: an npm automation token with publish rights on the `@schemabounce` scope. Packages publish as public with a provenance attestation.
+The workflow uses npm trusted publishing. GitHub proves the workflow's identity to npm over OIDC, so there is no token and no repository secret. Packages publish as public, and npm attaches a provenance attestation on its own.
+
+### One-time setup
+
+npm cannot register a trusted publisher for a package that does not exist yet, so a maintainer publishes the first version by hand:
+
+```bash
+npm login                       # browser sign-in with two-factor
+npm ci && npm test
+npm publish --provenance=false  # provenance only works from CI
+```
+
+Then, on npmjs.com under the package's Settings:
+
+1. Add a trusted publisher: GitHub Actions, organization `SchemaBounce`, repository `paperclip-adapter`, workflow filename `publish.yml`, no environment.
+2. Set publishing access to "Require two-factor authentication and disallow tokens".
+
+Every later version goes through the workflow.

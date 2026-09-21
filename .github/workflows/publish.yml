@@ -1,8 +1,11 @@
 name: Publish to npm
 
 # Manual only. Run it from main after bumping "version" in package.json.
-# Requires the NPM_TOKEN repository secret (an npm automation token with
-# publish rights on the @schemabounce scope).
+# Auth is npm trusted publishing (OIDC): no token, no secret. The package's
+# npm settings must list this repository and this workflow filename
+# (publish.yml) as a trusted publisher. npm cannot register a trusted
+# publisher for a package that does not exist yet, so the very first version
+# is published by a maintainer by hand (see README, Releasing).
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +16,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance attestation
+  id-token: write # OIDC identity for npm trusted publishing and provenance
 
 concurrency:
   group: npm-publish
@@ -35,6 +38,10 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Require an npm CLI that supports trusted publishing
+        run: |
+          npm --version
+          node -e "const [a,b,c]=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error('npm 11.5.1 or later is required'); process.exit(1) }"
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
@@ -53,6 +60,4 @@ jobs:
         run: npm publish --dry-run
       - name: Publish
         if: ${{ !inputs.dry_run }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish
