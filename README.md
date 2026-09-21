@@ -67,7 +67,7 @@ Never set `PAPERCLIP_RUN_ID` by hand.
 
 ## Development status
 
-The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and the SchemaBounce Hosted Agent Worker contract. It is not on npm yet.
+The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and the SchemaBounce Hosted Agent Worker contract. It is on npm as `@schemabounce/paperclip-adapter`.
 
 ## Releasing
 
@@ -79,17 +79,18 @@ The workflow uses npm trusted publishing. GitHub proves the workflow's identity 
 
 ### One-time setup
 
-npm cannot register a trusted publisher for a package that does not exist yet, so a maintainer publishes the first version by hand:
+Version `0.1.0` was published by hand, because npm cannot register a trusted publisher for a package that does not exist yet. Two settings remain, both done once.
 
-```bash
-npm login                       # browser sign-in with two-factor
-npm ci && npm test
-npm publish --provenance=false  # provenance only works from CI
-```
+On GitHub, under the repository's Settings, Environments:
 
-Then, on npmjs.com under the package's Settings:
+1. Create an environment named `npm-publish`.
+2. Add required reviewers, and limit deployment branches to `main`.
 
-1. Add a trusted publisher: GitHub Actions, organization `SchemaBounce`, repository `paperclip-adapter`, workflow filename `publish.yml`, no environment.
+On npmjs.com, under the package's Settings:
+
+1. Add a trusted publisher: GitHub Actions, organization `SchemaBounce`, repository `paperclip-adapter`, workflow filename `publish.yml`, environment `npm-publish`.
 2. Set publishing access to "Require two-factor authentication and disallow tokens".
+
+npm then accepts a publish only from that workflow, in that environment, after a reviewer approves the run. A leaked token or a workflow on another branch cannot publish.
 
 Every later version goes through the workflow.

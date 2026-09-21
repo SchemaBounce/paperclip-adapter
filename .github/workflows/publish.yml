@@ -26,23 +26,28 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The npm trusted publisher is bound to this environment name. Give the
+    # environment required reviewers and restrict it to the main branch in the
+    # repository settings, so a publish needs a second person's approval.
+    environment: npm-publish
     steps:
       - name: Refuse any ref other than main
         if: github.ref != 'refs/heads/main'
         run: |
           echo "Publishing is only allowed from main (got ${GITHUB_REF})." >&2
           exit 1
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-          cache: npm
           registry-url: https://registry.npmjs.org
       - name: Require an npm CLI that supports trusted publishing
         run: |
           npm --version
           node -e "const [a,b,c]=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error('npm 11.5.1 or later is required'); process.exit(1) }"
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
