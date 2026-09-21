@@ -79,13 +79,32 @@ is still working on the previous turn, and keeps the stored `a2aContextId`
 unchanged. It does not retry in a loop. The next heartbeat, on its normal
 schedule, sends the same `contextId` and continues the conversation.
 
-**Best effort, not guaranteed.** A transient failure while SchemaBounce is
-coordinating the conversation (for example, its own database being
-momentarily unreachable) also fails that one heartbeat and also keeps the
-stored `a2aContextId`, so the next heartbeat can still resume. Continuity is
-best effort: SchemaBounce does not currently report a separate signal
-confirming that a resumed turn actually reused the prior conversation's
-history, so the adapter cannot surface that confirmation either.
+**A transient coordination failure also keeps the context.** If SchemaBounce
+cannot coordinate the conversation turn (for example, its own database being
+momentarily unreachable), that one heartbeat also fails and also keeps the
+stored `a2aContextId`, so the next heartbeat can still resume.
+
+**The continuity signal.** When a heartbeat sends a stored `a2aContextId`,
+SchemaBounce reports back, in the adapter's run log, what memory the agent
+actually got for that turn:
+
+- `resumed`: the agent's full working state from the prior turn was
+  restored, the same way a normal SchemaBounce chat session resumes.
+- `history`: no working state was available, but the conversation's saved
+  transcript was loaded, so the agent sees the prior messages, not its prior
+  in-progress work.
+- `none`: the agent started the turn with no memory of any earlier one. This
+  is normal on the first turn of a new conversation. On a later turn, it
+  means neither the working state nor the transcript was available.
+
+This value describes only the turn that was just dispatched. It is not
+repeated on later status checks of the same task, so there is nothing to poll
+for it, and an older SchemaBounce deployment omits it entirely. When a
+heartbeat sends a stored `a2aContextId` and gets `none` back, the adapter
+writes one plain-language line to the run's log saying this turn ran without
+memory of earlier turns. That line is informational: it does not fail the
+heartbeat by itself, and the stored `a2aContextId` is never dropped because
+of it.
 
 ## Calling back into Paperclip
 

@@ -24,6 +24,13 @@
   fresh conversation on the next heartbeat: the server "chosen behavior" for
   a `contextId` owned by a different caller is to fork silently, never to
   reject, so the adapter cannot detect this case and does not attempt to.
+- Read the A2A continuity signal (`Task.Metadata["continuity"]`, core-api
+  docs/A2A_PROTOCOL_SPECIFICATION.md §15) off the `message/send` response and
+  write it to the run log as `resumed`, `history`, or `none`. When a
+  heartbeat sends a stored `a2aContextId` and the server answers `none`, the
+  adapter writes one extra plain-language log line noting the turn ran
+  without memory of earlier turns. Never treated as an error and never drops
+  the stored `a2aContextId`.
 
 ## 0.1.0
 

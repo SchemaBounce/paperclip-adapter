@@ -108,6 +108,50 @@ function successFetchMock() {
     );
 }
 
+// Same round-trip as successFetchMock, but the message/send response (the
+// ONLY place core-api ever reports Task.Metadata["continuity"] — see
+// knownA2AContinuity in wire.ts) carries whatever continuity value the test
+// wants to exercise. `continuityMetadata` is spread as-is so a test can pass
+// `undefined` (key entirely absent, like an older server) or an arbitrary
+// unrecognized value.
+function successFetchMockWithContinuity(continuityMetadata: Record<string, unknown>) {
+  return vi
+    .fn<typeof fetch>()
+    .mockResolvedValueOnce(
+      jsonResponse({ access_token: 'access-token', token_type: 'Bearer', expires_in: 3600 })
+    )
+    .mockResolvedValueOnce(
+      jsonResponse({
+        jsonrpc: '2.0',
+        id: 'rpc-1',
+        result: {
+          id: 'task_123',
+          contextId: 'ctx_123',
+          status: { state: 'TASK_STATE_SUBMITTED' },
+          metadata: continuityMetadata,
+        },
+      })
+    )
+    .mockResolvedValueOnce(
+      new Response(
+        'data: {"taskId":"task_123","contextId":"ctx_123","status":{"state":"TASK_STATE_COMPLETED"},"final":true}\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    )
+    .mockResolvedValueOnce(
+      jsonResponse({
+        jsonrpc: '2.0',
+        id: 'rpc-2',
+        result: { id: 'task_123', contextId: 'ctx_123', status: { state: 'TASK_STATE_COMPLETED' } },
+      })
+    );
+}
+
+function loggedLines(ctx: AdapterExecutionContext): string[] {
+  const onLog = ctx.onLog as unknown as ReturnType<typeof vi.fn>;
+  return onLog.mock.calls.map(call => String(call[1]));
+}
+
 describe('execute', () => {
   it('exchanges a token via Basic auth before doing anything else', async () => {
     const fetchMock = successFetchMock();
@@ -390,6 +434,112 @@ describe('execute', () => {
       expect(result.errorFamily).toBe('transient_upstream');
       expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_previous' });
       expect(result.sessionDisplayId).toBe('ctx_previous');
+    });
+  });
+
+  // core-api docs/A2A_PROTOCOL_SPECIFICATION.md §15 "Continuity signal":
+  // Task.Metadata["continuity"] is set ONLY on the message/send response
+  // (never on a later tasks/get), reporting "resumed" | "history" | "none".
+  // The adapter logs it and, for "none" on a heartbeat that sent a stored
+  // contextId, writes one extra plain note. It never becomes a result field
+  // and never changes exitCode/sessionParams.
+  describe('continuity signal', () => {
+    it.each(['resumed', 'history', 'none'] as const)(
+      'logs the %s continuity value from the dispatch response without changing the result shape',
+      async continuity => {
+        const fetchMock = successFetchMockWithContinuity({ continuity });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const ctx = context();
+        const result = await execute(ctx);
+
+        expect(result.exitCode).toBe(0);
+        expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_123' });
+
+        const lines = loggedLines(ctx);
+        expect(
+          lines.some(
+            line =>
+              line.includes('"kind":"continuity"') &&
+              line.includes(`"value":"${continuity}"`) &&
+              line.includes('"taskId":"task_123"')
+          )
+        ).toBe(true);
+      }
+    );
+
+    it('writes one extra plain-language note when a stored contextId was sent and the server answers none', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context(); // runtime.sessionParams.a2aContextId = 'ctx_previous'
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0); // informational only — never fails the heartbeat
+      expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_123' }); // still stores the new contextId normally
+
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('ran without memory of earlier turns'))).toBe(true);
+      expect(lines.some(line => line.includes('ctx_previous'))).toBe(true);
+    });
+
+    it('does not write the extra note for "resumed" or "history", or when no contextId was sent yet', async () => {
+      const resumedFetch = successFetchMockWithContinuity({ continuity: 'resumed' });
+      vi.stubGlobal('fetch', resumedFetch);
+      const resumedCtx = context();
+      await execute(resumedCtx);
+      expect(loggedLines(resumedCtx).some(line => line.includes('ran without memory'))).toBe(false);
+      vi.unstubAllGlobals();
+
+      const noneOnFirstTurnFetch = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', noneOnFirstTurnFetch);
+      const firstTurnCtx = context();
+      firstTurnCtx.runtime = { ...firstTurnCtx.runtime, sessionParams: null, sessionDisplayId: null };
+      await execute(firstTurnCtx);
+      // "none" on a fresh context (nothing was sent to lose) is the expected,
+      // unremarkable case — no extra note.
+      expect(loggedLines(firstTurnCtx).some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('tolerates an absent continuity key (older server) without logging or erroring', async () => {
+      const fetchMock = successFetchMockWithContinuity({});
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0);
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('"kind":"continuity"'))).toBe(false);
+      expect(lines.some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('tolerates an unrecognized continuity value: logs it raw but never treats it as "none"', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'some_future_value' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0);
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('"kind":"continuity"') && line.includes('some_future_value'))).toBe(
+        true
+      );
+      // Not a recognized value, so it must never trigger the "none" note.
+      expect(lines.some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('never exposes the client secret or bearer token in continuity log lines', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      await execute(ctx);
+
+      const loggedText = loggedLines(ctx).join('\n');
+      expect(loggedText).not.toContain('super-secret-value');
+      expect(loggedText).not.toContain('access-token');
     });
   });
 });

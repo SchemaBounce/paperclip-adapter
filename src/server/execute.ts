@@ -19,6 +19,7 @@ import { parseConfig } from './config.js';
 import {
   A2A_ERROR_CODE_CONTEXT_BUSY,
   A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE,
+  knownA2AContinuity,
   TERMINAL_STATES,
   type A2AStreamEvent,
   type A2ATask,
@@ -142,6 +143,33 @@ async function waitForTerminalTask(
     task = await getTask(config, token, initialTask.id, signal);
   }
   return { task, streamedText };
+}
+
+// logContinuity writes the A2A continuity signal (see knownA2AContinuity in
+// wire.ts) to Paperclip's run log. It never touches the returned
+// AdapterExecutionResult — no result field exists for this, and the sole
+// consequence of "none" (no memory this turn) is informational, not a
+// reason to fail the heartbeat or drop the stored contextId.
+async function logContinuity(
+  ctx: AdapterExecutionContext,
+  dispatchTask: A2ATask,
+  sentStoredContextId: string | undefined
+): Promise<void> {
+  const raw = dispatchTask.metadata?.continuity;
+  if (typeof raw !== 'string' || !raw.trim()) return; // absent — older server, or the contextId Contract wasn't in play.
+
+  await ctx.onLog(
+    'stdout',
+    `${LOG_PREFIX}${JSON.stringify({ kind: 'continuity', value: raw, taskId: dispatchTask.id, contextId: dispatchTask.contextId })}\n`
+  );
+
+  const known = knownA2AContinuity(raw);
+  if (known === 'none' && sentStoredContextId) {
+    await ctx.onLog(
+      'stdout',
+      `${LOG_PREFIX}This turn ran without memory of earlier turns in this conversation, even though a prior context (${sentStoredContextId}) was sent. The agent started fresh; this is informational, not an error, and the stored context continues to the next heartbeat.\n`
+    );
+  }
 }
 
 function resultForTask(task: A2ATask, streamedText: string[]): AdapterExecutionResult {
@@ -273,6 +301,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       'stdout',
       `${LOG_PREFIX}${JSON.stringify({ kind: 'dispatch', taskId: task.id, contextId: task.contextId })}\n`
     );
+    // The continuity signal (if any) is only ever on THIS response — the
+    // immediate result of message/send. core-api never repeats it on a
+    // later tasks/get read of the same task (see knownA2AContinuity in
+    // wire.ts), so it must be logged here, at dispatch time, not after
+    // waitForTerminalTask polls tasks/get to a terminal state.
+    await logContinuity(ctx, task, sessionContextId);
 
     const terminal = await waitForTerminalTask(ctx, config, token, task, runSignal.signal);
     return resultForTask(terminal.task, terminal.streamedText);
