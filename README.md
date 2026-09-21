@@ -51,6 +51,42 @@ The adapter type is `schemabounce`.
 
 The adapter never logs the client ID, client secret, or access token.
 
+## Conversation continuity
+
+Every heartbeat returns `sessionParams.a2aContextId`, which Paperclip stores
+and passes back on the next heartbeat as `ctx.runtime.sessionParams`. The
+adapter sends that value back to SchemaBounce as the message's `contextId`,
+so a wake, its follow-ups, and its recoveries stay in one hosted-agent
+conversation instead of starting over each time.
+
+**What continuity is scoped to.** A `contextId` is bound to the caller that
+first used it: the SchemaBounce workspace service account (`clientId`)
+configured for this adapter, together with the target agent. Two different
+service accounts, or two different agents, never share a conversation even if
+they are given the same stored `contextId`. If you rotate the service account
+credential, the next heartbeat starts a fresh conversation with no memory of
+the old one. The server does this silently: it does not return an error and
+the adapter cannot detect it, because SchemaBounce's `message/send` never
+rejects a reused `contextId` from a different caller; it forks to a new
+conversation and returns success. Treat rotating the service account the same
+as starting the Paperclip employee over.
+
+**What a busy response means.** SchemaBounce processes one turn per
+conversation at a time. If a heartbeat fires while the previous turn is still
+running, SchemaBounce refuses the new message instead of queuing it silently.
+The adapter reports that heartbeat as failed, with a message saying the agent
+is still working on the previous turn, and keeps the stored `a2aContextId`
+unchanged. It does not retry in a loop. The next heartbeat, on its normal
+schedule, sends the same `contextId` and continues the conversation.
+
+**Best effort, not guaranteed.** A transient failure while SchemaBounce is
+coordinating the conversation (for example, its own database being
+momentarily unreachable) also fails that one heartbeat and also keeps the
+stored `a2aContextId`, so the next heartbeat can still resume. Continuity is
+best effort: SchemaBounce does not currently report a separate signal
+confirming that a resumed turn actually reused the prior conversation's
+history, so the adapter cannot surface that confirmation either.
+
 ## Calling back into Paperclip
 
 The adapter only gets a SchemaBounce agent INTO a Paperclip heartbeat. For the

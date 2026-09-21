@@ -4,6 +4,7 @@ import {
   exchangeToken,
   getAgentCard,
   getTask,
+  isA2AErrorCode,
   listTasks,
   sendMessage,
   streamTask,
@@ -161,6 +162,84 @@ describe('sendMessage', () => {
       })
     ).rejects.toMatchObject({ code: 'a2a_-32602', message: 'message must contain at least one text part' });
   });
+
+  // core-api returns a non-2xx HTTP status alongside the JSON-RPC error body
+  // for context-busy (409) and conversation-unavailable (503) — see
+  // core-api docs/A2A_PROTOCOL_SPECIFICATION.md §15 "contextId Contract".
+  // The error code/message must still come from the JSON-RPC body, not a
+  // generic "HTTP 409" message, and the HTTP status must be preserved on the
+  // thrown error so callers can classify it (e.g. as transient_upstream).
+  it('surfaces the JSON-RPC code and message for a 409 context-busy response', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse(
+        {
+          jsonrpc: '2.0',
+          id: 'rpc-1',
+          error: {
+            code: -32010,
+            message: 'a previous message in this context is still being processed; wait for it to finish, then try again',
+          },
+        },
+        409
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      sendMessage(testConfig(), 'token-value', {
+        prompt: 'Do the thing',
+        paperclipTaskId: 'issue-9',
+        paperclipRunId: 'run-9',
+        contextId: 'ctx_prev',
+      })
+    ).rejects.toMatchObject({
+      name: 'SchemaBounceRequestError',
+      code: 'a2a_-32010',
+      status: 409,
+      message: expect.stringContaining('still being processed'),
+    });
+  });
+
+  it('surfaces the JSON-RPC code and message for a 503 conversation-unavailable response', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse(
+        {
+          jsonrpc: '2.0',
+          id: 'rpc-1',
+          error: { code: -32011, message: 'conversation coordination temporarily unavailable, try again' },
+        },
+        503
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      sendMessage(testConfig(), 'token-value', {
+        prompt: 'Do the thing',
+        paperclipTaskId: 'issue-9',
+        paperclipRunId: 'run-9',
+        contextId: 'ctx_prev',
+      })
+    ).rejects.toMatchObject({
+      name: 'SchemaBounceRequestError',
+      code: 'a2a_-32011',
+      status: 503,
+      message: expect.stringContaining('temporarily unavailable'),
+    });
+  });
+
+  it('falls back to a generic HTTP error when a non-2xx response has no JSON-RPC error shape', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response('gateway timeout', { status: 504 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      sendMessage(testConfig(), 'token-value', {
+        prompt: 'Do the thing',
+        paperclipTaskId: 'issue-9',
+        paperclipRunId: 'run-9',
+      })
+    ).rejects.toMatchObject({ code: 'http_error', status: 504 });
+  });
 });
 
 describe('getTask / listTasks / getAgentCard', () => {
@@ -250,5 +329,15 @@ describe('streamTask', () => {
     await expect(streamTask(testConfig(), 'token-value', 'task_1', async () => undefined)).rejects.toMatchObject(
       { code: 'stream_body_missing' }
     );
+  });
+});
+
+describe('isA2AErrorCode', () => {
+  it('matches only the SchemaBounceRequestError carrying that exact a2a error code', () => {
+    expect(isA2AErrorCode(new SchemaBounceRequestError('busy', 'a2a_-32010', 409), -32010)).toBe(true);
+    expect(isA2AErrorCode(new SchemaBounceRequestError('unavailable', 'a2a_-32011', 503), -32010)).toBe(false);
+    expect(isA2AErrorCode(new SchemaBounceRequestError('http', 'http_error', 504), -32010)).toBe(false);
+    expect(isA2AErrorCode(new Error('plain error'), -32010)).toBe(false);
+    expect(isA2AErrorCode('not an error', -32010)).toBe(false);
   });
 });

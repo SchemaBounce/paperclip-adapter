@@ -10,12 +10,20 @@ import {
   cancelTask,
   exchangeToken,
   getTask,
+  isA2AErrorCode,
   SchemaBounceRequestError,
   sendMessage,
   streamTask,
 } from './client.js';
 import { parseConfig } from './config.js';
-import { TERMINAL_STATES, type A2AStreamEvent, type A2ATask, type TaskState } from './wire.js';
+import {
+  A2A_ERROR_CODE_CONTEXT_BUSY,
+  A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE,
+  TERMINAL_STATES,
+  type A2AStreamEvent,
+  type A2ATask,
+  type TaskState,
+} from './wire.js';
 
 const LOG_PREFIX = '[schemabounce] ';
 
@@ -186,19 +194,35 @@ function resultForTask(task: A2ATask, streamedText: string[]): AdapterExecutionR
   };
 }
 
-function failureResult(error: unknown, timedOut: boolean): AdapterExecutionResult {
+// priorContextId is the a2aContextId this run already had stored (from
+// ctx.runtime.sessionParams) before this call started. -32010/-32011 both
+// come from message/send's conversation row-claim (core-api
+// docs/A2A_PROTOCOL_SPECIFICATION.md §15 "contextId Contract") failing
+// BEFORE the server dispatches a new turn — the conversation itself, and the
+// contextId that names it, are untouched. Dropping the stored contextId here
+// would start a brand-new conversation on the next heartbeat for no reason;
+// keeping it lets the next heartbeat resume exactly where this one left off.
+function failureResult(error: unknown, timedOut: boolean, priorContextId?: string): AdapterExecutionResult {
   const message = error instanceof Error ? error.message : String(error);
+  const busy = isA2AErrorCode(error, A2A_ERROR_CODE_CONTEXT_BUSY);
+  const unavailable = isA2AErrorCode(error, A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE);
+
   return {
     exitCode: 1,
     signal: null,
     timedOut,
     errorCode:
       error instanceof SchemaBounceRequestError ? error.code : timedOut ? 'timeout' : 'schemabounce_error',
-    errorMessage: message,
+    errorMessage: busy
+      ? `The agent is still working on the previous turn in this conversation, so this heartbeat did not start a new one. It will pick up on the next heartbeat. (${message})`
+      : message,
     errorFamily:
       error instanceof SchemaBounceRequestError && (error.status === 429 || (error.status ?? 0) >= 500)
         ? 'transient_upstream'
         : null,
+    ...((busy || unavailable) && priorContextId
+      ? { sessionParams: { a2aContextId: priorContextId }, sessionDisplayId: priorContextId }
+      : {}),
   };
 }
 
@@ -211,6 +235,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const runSignal = createTimeoutSignal(config.timeoutSec);
+  // Read before the try block so it is still available in the catch below —
+  // it names the conversation this run is (or would be) part of, and a
+  // context-busy/conversation-unavailable failure needs to report it back
+  // unchanged (see failureResult).
+  const sessionContextId = stringValue(ctx.runtime.sessionParams?.a2aContextId);
   let token: string | undefined;
   let task: A2ATask | undefined;
   try {
@@ -227,7 +256,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     token = await exchangeToken(config, runSignal.signal);
     const identity = taskIdentity(ctx);
-    const sessionContextId = stringValue(ctx.runtime.sessionParams?.a2aContextId);
     task = await sendMessage(
       config,
       token,
@@ -256,7 +284,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Cancellation is best effort after the run has already stopped.
       }
     }
-    return failureResult(error, runSignal.timedOut());
+    return failureResult(error, runSignal.timedOut(), sessionContextId);
   } finally {
     runSignal.cleanup();
   }

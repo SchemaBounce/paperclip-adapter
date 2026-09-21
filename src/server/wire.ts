@@ -69,3 +69,18 @@ export const TERMINAL_STATES = new Set<TaskState>([
   'TASK_STATE_CANCELED',
   'TASK_STATE_REJECTED',
 ]);
+
+// Documented in core-api docs/A2A_PROTOCOL_SPECIFICATION.md §15 "contextId
+// Contract". Both codes are only ever returned by `message/send` (the row
+// claim that binds a contextId to one conversation happens there, not on
+// tasks/get, tasks/list, or tasks/cancel).
+//
+// -32010 context busy (HTTP 409): another send on the same (owner, contextId)
+// is still in flight. The server refuses the send outright and terminalizes
+// the run it had already created; nothing was left running.
+//
+// -32011 conversation unavailable (HTTP 503): the row-claim infrastructure
+// (Postgres) could not be reached. The server fails closed rather than
+// skipping the claim, which would let two concurrent sends interleave turns.
+export const A2A_ERROR_CODE_CONTEXT_BUSY = -32010;
+export const A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE = -32011;

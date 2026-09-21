@@ -1,6 +1,6 @@
 {
   "name": "@schemabounce/paperclip-adapter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run SchemaBounce hosted agents as Paperclip workers",
   "type": "module",
   "license": "MIT",
@@ -38,6 +38,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

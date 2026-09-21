@@ -37,6 +37,22 @@ async function errorForResponse(response: Response, operation: string) {
   return new SchemaBounceRequestError(message, 'http_error', response.status);
 }
 
+// errorForParsedResponse is errorForResponse's twin for rpc(), which has
+// already consumed the response body (a Response can only be read once) to
+// check for a JSON-RPC error shape first. Builds the same generic
+// "<operation> failed: <detail>" message from whatever was parsed, without a
+// second response.json() call.
+function errorForParsedResponse(
+  response: Response,
+  operation: string,
+  body: Record<string, unknown> | undefined
+): SchemaBounceRequestError {
+  let message = `${operation} failed with HTTP ${response.status}`;
+  const detail = body?.error_description ?? body?.message;
+  if (typeof detail === 'string' && detail.trim()) message = `${operation} failed: ${detail}`;
+  return new SchemaBounceRequestError(message, 'http_error', response.status);
+}
+
 export async function exchangeToken(
   config: SchemaBounceAdapterConfig,
   signal?: AbortSignal
@@ -66,6 +82,12 @@ export async function exchangeToken(
   return token.access_token;
 }
 
+// isA2AErrorCode narrows a caught error down to a specific JSON-RPC error
+// code returned by the A2A endpoint (e.g. A2A_ERROR_CODE_CONTEXT_BUSY).
+export function isA2AErrorCode(error: unknown, code: number): error is SchemaBounceRequestError {
+  return error instanceof SchemaBounceRequestError && error.code === `a2a_${code}`;
+}
+
 export async function rpc<T>(
   config: SchemaBounceAdapterConfig,
   token: string,
@@ -83,12 +105,28 @@ export async function rpc<T>(
     body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method, params }),
     signal,
   });
-  if (!response.ok) throw await errorForResponse(response, method);
-  const payload = (await response.json()) as JsonRpcResponse<T>;
-  if (payload.error) {
-    throw new SchemaBounceRequestError(payload.error.message, `a2a_${payload.error.code}`);
+
+  // The A2A handler returns a non-2xx HTTP status for most JSON-RPC errors
+  // (409 for context-busy, 503 for conversation-unavailable, 404 for
+  // task-not-found, etc. — core-api docs/A2A_PROTOCOL_SPECIFICATION.md §10
+  // and §15), but the body is still the structured JSON-RPC {code, message}
+  // shape. Parse the body before branching on response.ok, so a non-2xx
+  // JSON-RPC error surfaces its real code/message instead of a generic HTTP
+  // error that callers (e.g. execute.ts's busy/unavailable handling) cannot
+  // recognize.
+  let payload: JsonRpcResponse<T> | undefined;
+  try {
+    payload = (await response.json()) as JsonRpcResponse<T>;
+  } catch {
+    payload = undefined;
   }
-  if (payload.result === undefined) {
+  if (payload?.error) {
+    throw new SchemaBounceRequestError(payload.error.message, `a2a_${payload.error.code}`, response.status);
+  }
+  if (!response.ok) {
+    throw errorForParsedResponse(response, method, payload as unknown as Record<string, unknown> | undefined);
+  }
+  if (payload === undefined || payload.result === undefined) {
     throw new SchemaBounceRequestError(`${method} returned no result`, 'a2a_result_missing');
   }
   return payload.result;
