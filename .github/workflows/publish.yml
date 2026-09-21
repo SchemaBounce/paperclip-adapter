@@ -1,0 +1,58 @@
+name: Publish to npm
+
+# Manual only. Run it from main after bumping "version" in package.json.
+# Requires the NPM_TOKEN repository secret (an npm automation token with
+# publish rights on the @schemabounce scope).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Pack and verify only, publish nothing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance attestation
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Refuse any ref other than main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Publishing is only allowed from main (got ${GITHUB_REF})." >&2
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - name: Refuse a version that is already published
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "${NAME}@${VERSION} is already on npm. Bump the version first." >&2
+            exit 1
+          fi
+          echo "Publishing ${NAME}@${VERSION}"
+      - name: Dry run
+        if: inputs.dry_run
+        run: npm publish --dry-run
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish

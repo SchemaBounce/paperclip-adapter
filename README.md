@@ -67,4 +67,12 @@ Never set `PAPERCLIP_RUN_ID` by hand.
 
 ## Development status
 
-The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and the SchemaBounce Hosted Agent Worker contract. Publishing to npm and creating the public GitHub repository are separate release actions.
+The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and the SchemaBounce Hosted Agent Worker contract. It is not on npm yet.
+
+## Releasing
+
+1. Bump `version` in `package.json` on `main`.
+2. Run the **Publish to npm** workflow from the Actions tab. It defaults to a dry run that builds, tests, and packs without publishing.
+3. Run it again with the dry run box cleared to publish. The workflow refuses any ref other than `main` and any version already on npm.
+
+The workflow needs the `NPM_TOKEN` repository secret: an npm automation token with publish rights on the `@schemabounce` scope. Packages publish as public with a provenance attestation.
