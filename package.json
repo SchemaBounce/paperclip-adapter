@@ -7,7 +7,7 @@
   "author": "SchemaBounce",
   "repository": {
     "type": "git",
-    "url": "https://github.com/SchemaBounce/paperclip-adapter"
+    "url": "git+https://github.com/SchemaBounce/paperclip-adapter.git"
   },
   "homepage": "https://schemabounce.com",
   "keywords": [
