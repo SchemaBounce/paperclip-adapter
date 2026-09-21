@@ -10,12 +10,21 @@ import {
   cancelTask,
   exchangeToken,
   getTask,
+  isA2AErrorCode,
   SchemaBounceRequestError,
   sendMessage,
   streamTask,
 } from './client.js';
 import { parseConfig } from './config.js';
-import { TERMINAL_STATES, type A2AStreamEvent, type A2ATask, type TaskState } from './wire.js';
+import {
+  A2A_ERROR_CODE_CONTEXT_BUSY,
+  A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE,
+  knownA2AContinuity,
+  TERMINAL_STATES,
+  type A2AStreamEvent,
+  type A2ATask,
+  type TaskState,
+} from './wire.js';
 
 const LOG_PREFIX = '[schemabounce] ';
 
@@ -136,6 +145,33 @@ async function waitForTerminalTask(
   return { task, streamedText };
 }
 
+// logContinuity writes the A2A continuity signal (see knownA2AContinuity in
+// wire.ts) to Paperclip's run log. It never touches the returned
+// AdapterExecutionResult — no result field exists for this, and the sole
+// consequence of "none" (no memory this turn) is informational, not a
+// reason to fail the heartbeat or drop the stored contextId.
+async function logContinuity(
+  ctx: AdapterExecutionContext,
+  dispatchTask: A2ATask,
+  sentStoredContextId: string | undefined
+): Promise<void> {
+  const raw = dispatchTask.metadata?.continuity;
+  if (typeof raw !== 'string' || !raw.trim()) return; // absent — older server, or the contextId Contract wasn't in play.
+
+  await ctx.onLog(
+    'stdout',
+    `${LOG_PREFIX}${JSON.stringify({ kind: 'continuity', value: raw, taskId: dispatchTask.id, contextId: dispatchTask.contextId })}\n`
+  );
+
+  const known = knownA2AContinuity(raw);
+  if (known === 'none' && sentStoredContextId) {
+    await ctx.onLog(
+      'stdout',
+      `${LOG_PREFIX}This turn ran without memory of earlier turns in this conversation, even though a prior context (${sentStoredContextId}) was sent. The agent started fresh; this is informational, not an error, and the stored context continues to the next heartbeat.\n`
+    );
+  }
+}
+
 function resultForTask(task: A2ATask, streamedText: string[]): AdapterExecutionResult {
   const usage = task.metadata?.usage;
   const completed = task.status.state === 'TASK_STATE_COMPLETED';
@@ -186,19 +222,35 @@ function resultForTask(task: A2ATask, streamedText: string[]): AdapterExecutionR
   };
 }
 
-function failureResult(error: unknown, timedOut: boolean): AdapterExecutionResult {
+// priorContextId is the a2aContextId this run already had stored (from
+// ctx.runtime.sessionParams) before this call started. -32010/-32011 both
+// come from message/send's conversation row-claim (core-api
+// docs/A2A_PROTOCOL_SPECIFICATION.md §15 "contextId Contract") failing
+// BEFORE the server dispatches a new turn — the conversation itself, and the
+// contextId that names it, are untouched. Dropping the stored contextId here
+// would start a brand-new conversation on the next heartbeat for no reason;
+// keeping it lets the next heartbeat resume exactly where this one left off.
+function failureResult(error: unknown, timedOut: boolean, priorContextId?: string): AdapterExecutionResult {
   const message = error instanceof Error ? error.message : String(error);
+  const busy = isA2AErrorCode(error, A2A_ERROR_CODE_CONTEXT_BUSY);
+  const unavailable = isA2AErrorCode(error, A2A_ERROR_CODE_CONVERSATION_UNAVAILABLE);
+
   return {
     exitCode: 1,
     signal: null,
     timedOut,
     errorCode:
       error instanceof SchemaBounceRequestError ? error.code : timedOut ? 'timeout' : 'schemabounce_error',
-    errorMessage: message,
+    errorMessage: busy
+      ? `The agent is still working on the previous turn in this conversation, so this heartbeat did not start a new one. It will pick up on the next heartbeat. (${message})`
+      : message,
     errorFamily:
       error instanceof SchemaBounceRequestError && (error.status === 429 || (error.status ?? 0) >= 500)
         ? 'transient_upstream'
         : null,
+    ...((busy || unavailable) && priorContextId
+      ? { sessionParams: { a2aContextId: priorContextId }, sessionDisplayId: priorContextId }
+      : {}),
   };
 }
 
@@ -211,6 +263,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const runSignal = createTimeoutSignal(config.timeoutSec);
+  // Read before the try block so it is still available in the catch below —
+  // it names the conversation this run is (or would be) part of, and a
+  // context-busy/conversation-unavailable failure needs to report it back
+  // unchanged (see failureResult).
+  const sessionContextId = stringValue(ctx.runtime.sessionParams?.a2aContextId);
   let token: string | undefined;
   let task: A2ATask | undefined;
   try {
@@ -227,7 +284,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     token = await exchangeToken(config, runSignal.signal);
     const identity = taskIdentity(ctx);
-    const sessionContextId = stringValue(ctx.runtime.sessionParams?.a2aContextId);
     task = await sendMessage(
       config,
       token,
@@ -245,6 +301,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       'stdout',
       `${LOG_PREFIX}${JSON.stringify({ kind: 'dispatch', taskId: task.id, contextId: task.contextId })}\n`
     );
+    // The continuity signal (if any) is only ever on THIS response — the
+    // immediate result of message/send. core-api never repeats it on a
+    // later tasks/get read of the same task (see knownA2AContinuity in
+    // wire.ts), so it must be logged here, at dispatch time, not after
+    // waitForTerminalTask polls tasks/get to a terminal state.
+    await logContinuity(ctx, task, sessionContextId);
 
     const terminal = await waitForTerminalTask(ctx, config, token, task, runSignal.signal);
     return resultForTask(terminal.task, terminal.streamedText);
@@ -256,7 +318,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Cancellation is best effort after the run has already stopped.
       }
     }
-    return failureResult(error, runSignal.timedOut());
+    return failureResult(error, runSignal.timedOut(), sessionContextId);
   } finally {
     runSignal.cleanup();
   }

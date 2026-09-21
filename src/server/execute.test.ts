@@ -108,6 +108,50 @@ function successFetchMock() {
     );
 }
 
+// Same round-trip as successFetchMock, but the message/send response (the
+// ONLY place core-api ever reports Task.Metadata["continuity"] — see
+// knownA2AContinuity in wire.ts) carries whatever continuity value the test
+// wants to exercise. `continuityMetadata` is spread as-is so a test can pass
+// `undefined` (key entirely absent, like an older server) or an arbitrary
+// unrecognized value.
+function successFetchMockWithContinuity(continuityMetadata: Record<string, unknown>) {
+  return vi
+    .fn<typeof fetch>()
+    .mockResolvedValueOnce(
+      jsonResponse({ access_token: 'access-token', token_type: 'Bearer', expires_in: 3600 })
+    )
+    .mockResolvedValueOnce(
+      jsonResponse({
+        jsonrpc: '2.0',
+        id: 'rpc-1',
+        result: {
+          id: 'task_123',
+          contextId: 'ctx_123',
+          status: { state: 'TASK_STATE_SUBMITTED' },
+          metadata: continuityMetadata,
+        },
+      })
+    )
+    .mockResolvedValueOnce(
+      new Response(
+        'data: {"taskId":"task_123","contextId":"ctx_123","status":{"state":"TASK_STATE_COMPLETED"},"final":true}\n\n',
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    )
+    .mockResolvedValueOnce(
+      jsonResponse({
+        jsonrpc: '2.0',
+        id: 'rpc-2',
+        result: { id: 'task_123', contextId: 'ctx_123', status: { state: 'TASK_STATE_COMPLETED' } },
+      })
+    );
+}
+
+function loggedLines(ctx: AdapterExecutionContext): string[] {
+  const onLog = ctx.onLog as unknown as ReturnType<typeof vi.fn>;
+  return onLog.mock.calls.map(call => String(call[1]));
+}
+
 describe('execute', () => {
   it('exchanges a token via Basic auth before doing anything else', async () => {
     const fetchMock = successFetchMock();
@@ -270,5 +314,232 @@ describe('execute', () => {
     expect(loggedText).not.toContain('access-token');
     expect(metaText).not.toContain('super-secret-value');
     expect(metaText).not.toContain('access-token');
+  });
+
+  // core-api docs/A2A_PROTOCOL_SPECIFICATION.md §15 "contextId Contract":
+  // message/send refuses a send that races another in-flight send on the
+  // same (owner, contextId) with -32010 (HTTP 409) rather than queueing it
+  // invisibly. The adapter must report this as a non-fatal failed heartbeat
+  // (not a crash, not a reason to drop the stored contextId) so the next
+  // heartbeat continues the same conversation.
+  describe('context-busy (-32010)', () => {
+    function busyFetchMock() {
+      return vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse({ access_token: 'access-token', token_type: 'Bearer', expires_in: 3600 })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse(
+            {
+              jsonrpc: '2.0',
+              id: 'rpc-1',
+              error: {
+                code: -32010,
+                message:
+                  'a previous message in this context is still being processed; wait for it to finish, then try again',
+              },
+            },
+            409
+          )
+        );
+    }
+
+    it('returns a non-fatal failed heartbeat and keeps the stored contextId', async () => {
+      const fetchMock = busyFetchMock();
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await execute(context());
+
+      expect(result.exitCode).toBe(1);
+      expect(result.timedOut).toBe(false);
+      expect(result.errorCode).toBe('a2a_-32010');
+      expect(result.errorMessage).toContain('still working on the previous turn');
+      expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_previous' });
+      expect(result.sessionDisplayId).toBe('ctx_previous');
+      // Only two calls: token exchange and the refused send. No stream, no
+      // getTask, no tight retry loop.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('never exposes the client secret or bearer token in the busy failure', async () => {
+      const fetchMock = busyFetchMock();
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      const result = await execute(ctx);
+
+      const onLog = ctx.onLog as unknown as ReturnType<typeof vi.fn>;
+      const onMeta = ctx.onMeta as unknown as ReturnType<typeof vi.fn>;
+      const loggedText = onLog.mock.calls.map(call => String(call[1])).join('\n');
+      const metaText = JSON.stringify(onMeta.mock.calls);
+      const resultText = JSON.stringify(result);
+
+      expect(loggedText).not.toContain('super-secret-value');
+      expect(loggedText).not.toContain('access-token');
+      expect(metaText).not.toContain('super-secret-value');
+      expect(metaText).not.toContain('access-token');
+      expect(resultText).not.toContain('super-secret-value');
+      expect(resultText).not.toContain('access-token');
+    });
+
+    it('has no stored contextId to preserve on a first-ever heartbeat and omits sessionParams', async () => {
+      const fetchMock = busyFetchMock();
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      ctx.runtime = { ...ctx.runtime, sessionParams: null, sessionDisplayId: null };
+
+      const result = await execute(ctx);
+
+      expect(result.errorCode).toBe('a2a_-32010');
+      expect(result.sessionParams).toBeUndefined();
+    });
+  });
+
+  // -32011 (HTTP 503) is a transient infrastructure failure in the
+  // conversation row-claim (Postgres unreachable), distinct from busy: the
+  // server fails closed rather than skipping the claim. Also non-fatal, also
+  // keeps the stored contextId.
+  describe('conversation-unavailable (-32011)', () => {
+    function unavailableFetchMock() {
+      return vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse({ access_token: 'access-token', token_type: 'Bearer', expires_in: 3600 })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse(
+            {
+              jsonrpc: '2.0',
+              id: 'rpc-1',
+              error: {
+                code: -32011,
+                message: 'conversation coordination temporarily unavailable, try again',
+              },
+            },
+            503
+          )
+        );
+    }
+
+    it('returns a transient failed heartbeat and keeps the stored contextId', async () => {
+      const fetchMock = unavailableFetchMock();
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await execute(context());
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe('a2a_-32011');
+      expect(result.errorFamily).toBe('transient_upstream');
+      expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_previous' });
+      expect(result.sessionDisplayId).toBe('ctx_previous');
+    });
+  });
+
+  // core-api docs/A2A_PROTOCOL_SPECIFICATION.md §15 "Continuity signal":
+  // Task.Metadata["continuity"] is set ONLY on the message/send response
+  // (never on a later tasks/get), reporting "resumed" | "history" | "none".
+  // The adapter logs it and, for "none" on a heartbeat that sent a stored
+  // contextId, writes one extra plain note. It never becomes a result field
+  // and never changes exitCode/sessionParams.
+  describe('continuity signal', () => {
+    it.each(['resumed', 'history', 'none'] as const)(
+      'logs the %s continuity value from the dispatch response without changing the result shape',
+      async continuity => {
+        const fetchMock = successFetchMockWithContinuity({ continuity });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const ctx = context();
+        const result = await execute(ctx);
+
+        expect(result.exitCode).toBe(0);
+        expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_123' });
+
+        const lines = loggedLines(ctx);
+        expect(
+          lines.some(
+            line =>
+              line.includes('"kind":"continuity"') &&
+              line.includes(`"value":"${continuity}"`) &&
+              line.includes('"taskId":"task_123"')
+          )
+        ).toBe(true);
+      }
+    );
+
+    it('writes one extra plain-language note when a stored contextId was sent and the server answers none', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context(); // runtime.sessionParams.a2aContextId = 'ctx_previous'
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0); // informational only — never fails the heartbeat
+      expect(result.sessionParams).toEqual({ a2aContextId: 'ctx_123' }); // still stores the new contextId normally
+
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('ran without memory of earlier turns'))).toBe(true);
+      expect(lines.some(line => line.includes('ctx_previous'))).toBe(true);
+    });
+
+    it('does not write the extra note for "resumed" or "history", or when no contextId was sent yet', async () => {
+      const resumedFetch = successFetchMockWithContinuity({ continuity: 'resumed' });
+      vi.stubGlobal('fetch', resumedFetch);
+      const resumedCtx = context();
+      await execute(resumedCtx);
+      expect(loggedLines(resumedCtx).some(line => line.includes('ran without memory'))).toBe(false);
+      vi.unstubAllGlobals();
+
+      const noneOnFirstTurnFetch = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', noneOnFirstTurnFetch);
+      const firstTurnCtx = context();
+      firstTurnCtx.runtime = { ...firstTurnCtx.runtime, sessionParams: null, sessionDisplayId: null };
+      await execute(firstTurnCtx);
+      // "none" on a fresh context (nothing was sent to lose) is the expected,
+      // unremarkable case — no extra note.
+      expect(loggedLines(firstTurnCtx).some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('tolerates an absent continuity key (older server) without logging or erroring', async () => {
+      const fetchMock = successFetchMockWithContinuity({});
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0);
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('"kind":"continuity"'))).toBe(false);
+      expect(lines.some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('tolerates an unrecognized continuity value: logs it raw but never treats it as "none"', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'some_future_value' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0);
+      const lines = loggedLines(ctx);
+      expect(lines.some(line => line.includes('"kind":"continuity"') && line.includes('some_future_value'))).toBe(
+        true
+      );
+      // Not a recognized value, so it must never trigger the "none" note.
+      expect(lines.some(line => line.includes('ran without memory'))).toBe(false);
+    });
+
+    it('never exposes the client secret or bearer token in continuity log lines', async () => {
+      const fetchMock = successFetchMockWithContinuity({ continuity: 'none' });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const ctx = context();
+      await execute(ctx);
+
+      const loggedText = loggedLines(ctx).join('\n');
+      expect(loggedText).not.toContain('super-secret-value');
+      expect(loggedText).not.toContain('access-token');
+    });
   });
 });
