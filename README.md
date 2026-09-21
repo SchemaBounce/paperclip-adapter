@@ -126,9 +126,12 @@ The package is implemented against `@paperclipai/adapter-utils` `2026.831.1` and
 
 ## Releasing
 
-1. Bump `version` in `package.json` on `main`.
-2. Run the **Publish to npm** workflow from the Actions tab. It defaults to a dry run that builds, tests, and packs without publishing.
-3. Run it again with the dry run box cleared to publish. The workflow refuses any ref other than `main` and any version already on npm.
+All work lands on `development`. `main` is the release branch.
+
+1. On `development`, bump `version` in `package.json` and add the `CHANGELOG.md` entry.
+2. Open a pull request from `development` to `main` and merge it. That is the only pull request this repository uses.
+3. From `main`, run the **Publish to npm** workflow from the Actions tab. It defaults to a dry run that builds, tests, and packs without publishing.
+4. Run it again with the dry run box cleared to publish. The workflow refuses any ref other than `main` and any version already on npm.
 
 The workflow uses npm trusted publishing. GitHub proves the workflow's identity to npm over OIDC, so there is no token and no repository secret. Packages publish as public, and npm attaches a provenance attestation on its own.
 

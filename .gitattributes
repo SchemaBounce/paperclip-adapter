@@ -1,0 +1,7 @@
+# Store and check out every text file with LF, on every platform. Without this,
+# a Windows-side git with core.autocrlf=true rewrites the whole tree to CRLF and
+# every file shows as modified with no real change.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.tgz binary
