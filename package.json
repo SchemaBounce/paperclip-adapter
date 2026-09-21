@@ -1,0 +1,64 @@
+{
+  "name": "@schemabounce/paperclip-adapter",
+  "version": "0.1.0",
+  "description": "Run SchemaBounce hosted agents as Paperclip workers",
+  "type": "module",
+  "license": "MIT",
+  "author": "SchemaBounce",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SchemaBounce/paperclip-adapter"
+  },
+  "homepage": "https://schemabounce.com",
+  "keywords": [
+    "paperclip",
+    "schemabounce",
+    "a2a",
+    "ai-agent",
+    "adapter",
+    "orchestration"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./ui-parser": {
+      "types": "./dist/ui-parser.d.ts",
+      "import": "./dist/ui-parser.js"
+    }
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "2026.831.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
